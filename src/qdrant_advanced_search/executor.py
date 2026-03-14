@@ -2,13 +2,7 @@
 
 from __future__ import annotations
 
-from query_parser import (
-    BoolNode,
-    ComplexQuery,
-    Literal,
-    SimpleQuery,
-    parse_query,
-)
+from dataclasses import dataclass
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -22,15 +16,30 @@ from qdrant_client.models import (
 )
 from sentence_transformers import SentenceTransformer
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+from qdrant_advanced_search.parser import (
+    BoolNode,
+    ComplexQuery,
+    Literal,
+    SimpleQuery,
+    parse_query,
+)
 
-QDRANT_URL = "http://localhost:6333"
-COLLECTION_NAME = "documents"
-MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
-DEFAULT_LIMIT = 10
-DEFAULT_PRE_LIMIT = 50
+
+@dataclass
+class SearchResult:
+    """A single search result with document metadata.
+
+    Attributes:
+        document_id: The parent document identifier.
+        paragraph_id: The matched paragraph identifier.
+        tags: Tag string for the document (e.g. "#SPORT, #NATURE").
+        paragraph_text: The text of the matched paragraph.
+    """
+
+    document_id: int
+    paragraph_id: int
+    tags: str
+    paragraph_text: str
 
 
 # ---------------------------------------------------------------------------
@@ -42,13 +51,51 @@ class QueryExecutor:
     """Execute structured search queries against a Qdrant collection.
 
     Loads a SentenceTransformer model and connects to Qdrant on instantiation.
-    Ensures full-text payload indexes exist on ``text`` and ``tags`` fields.
+    Ensures full-text payload indexes exist on the configured text and tags fields.
     """
 
-    def __init__(self) -> None:
-        """Initialise the model, Qdrant client, and payload indexes."""
-        self._model = SentenceTransformer(MODEL_NAME)
-        self._client = QdrantClient(url=QDRANT_URL)
+    def __init__(
+        self,
+        *,
+        qdrant_url: str = "http://localhost:6333",
+        collection_name: str = "documents",
+        model: str | SentenceTransformer = "paraphrase-multilingual-MiniLM-L12-v2",
+        text_field: str = "text",
+        tags_field: str = "tags",
+        document_id_field: str = "document_id",
+        paragraph_id_field: str = "paragraph_id",
+        default_limit: int = 10,
+        default_pre_limit: int = 50,
+    ) -> None:
+        """Initialise the model, Qdrant client, and payload indexes.
+
+        Args:
+            qdrant_url: URL of the Qdrant instance.
+            collection_name: Name of the Qdrant collection to search.
+            model: Either a model name string or an already-loaded
+                SentenceTransformer instance.
+            text_field: Payload field containing paragraph text.
+            tags_field: Payload field containing the tag string.
+            document_id_field: Payload field containing the document identifier.
+            paragraph_id_field: Payload field containing the paragraph identifier.
+            default_limit: Default result limit for main queries.
+            default_pre_limit: Default result limit for prefetch queries.
+        """
+        if isinstance(model, str):
+            self._model = SentenceTransformer(model)
+        else:
+            self._model = model
+
+        self._qdrant_url = qdrant_url
+        self._collection_name = collection_name
+        self._text_field = text_field
+        self._tags_field = tags_field
+        self._document_id_field = document_id_field
+        self._paragraph_id_field = paragraph_id_field
+        self._default_limit = default_limit
+        self._default_pre_limit = default_pre_limit
+
+        self._client = QdrantClient(url=qdrant_url)
         self._ensure_indexes()
 
     # ------------------------------------------------------------------
@@ -57,10 +104,10 @@ class QueryExecutor:
 
     def _ensure_indexes(self) -> None:
         """Create full-text payload indexes if they do not already exist."""
-        for field_name in ("text", "tags"):
+        for field_name in (self._text_field, self._tags_field):
             try:
                 self._client.create_payload_index(
-                    COLLECTION_NAME,
+                    self._collection_name,
                     field_name=field_name,
                     field_schema=PayloadSchemaType.TEXT,
                 )
@@ -122,31 +169,48 @@ class QueryExecutor:
             return f1
         return Filter(must=[f1, f2])
 
-    @staticmethod
-    def _extract_ids(payload_list: list[dict]) -> list[int]:
-        """Extract document_id values from a list of payloads.
+    def _extract_results(self, payload_list: list[dict]) -> list[SearchResult]:
+        """Build deduplicated SearchResult objects from a list of payloads.
+
+        One result per document_id, keeping the first (highest-ranked) paragraph.
 
         Args:
-            payload_list: List of payload dicts, each containing "document_id".
+            payload_list: List of payload dicts from Qdrant points.
 
         Returns:
-            Deduplicated list of document IDs preserving order.
+            Deduplicated list of SearchResult preserving result order.
         """
-        ids = [p["document_id"] for p in payload_list if p and "document_id" in p]
-        return list(dict.fromkeys(ids))
+        seen: set[int] = set()
+        results: list[SearchResult] = []
+        for p in payload_list:
+            if not p or self._document_id_field not in p:
+                continue
+            doc_id = int(p[self._document_id_field])
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            results.append(
+                SearchResult(
+                    document_id=doc_id,
+                    paragraph_id=int(p.get(self._paragraph_id_field, 0)),
+                    tags=p.get(self._tags_field, ""),
+                    paragraph_text=p.get(self._text_field, ""),
+                )
+            )
+        return results
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
-    def execute(self, raw_query: str) -> list[int]:
+    def execute(self, raw_query: str) -> list[SearchResult]:
         """Parse and execute a raw query string.
 
         Args:
             raw_query: The user's raw query string.
 
         Returns:
-            A deduplicated list of document IDs matching the query, preserving
+            A deduplicated list of SearchResult matching the query, preserving
             result order.
         """
         parsed = parse_query(raw_query)
@@ -158,36 +222,36 @@ class QueryExecutor:
     # Simple query
     # ------------------------------------------------------------------
 
-    def _run_simple(self, q: SimpleQuery) -> list[int]:
+    def _run_simple(self, q: SimpleQuery) -> list[SearchResult]:
         """Execute a plain semantic search query.
 
         Args:
             q: The SimpleQuery to execute.
 
         Returns:
-            List of document IDs.
+            List of SearchResult objects.
         """
         vec = self._encode(q.text)
         result = self._client.query_points(
-            collection_name=COLLECTION_NAME,
+            collection_name=self._collection_name,
             query=vec,
-            limit=DEFAULT_LIMIT,
+            limit=self._default_limit,
         )
         payloads = [p.payload or {} for p in result.points]
-        return self._extract_ids(payloads)
+        return self._extract_results(payloads)
 
     # ------------------------------------------------------------------
     # Complex query
     # ------------------------------------------------------------------
 
-    def _run_complex(self, q: ComplexQuery) -> list[int]:
+    def _run_complex(self, q: ComplexQuery) -> list[SearchResult]:
         """Execute a complex structured query with optional prefetch.
 
         Args:
             q: The ComplexQuery to execute.
 
         Returns:
-            Deduplicated list of document IDs preserving result order.
+            Deduplicated list of SearchResult preserving result order.
         """
         pre = q.prefetch
         req = q.req
@@ -195,13 +259,13 @@ class QueryExecutor:
         # Build req filters
         req_tags_filter: Filter | None = None
         if req.tags is not None:
-            req_tags_filter = self._bool_to_filter(req.tags, "tags")
+            req_tags_filter = self._bool_to_filter(req.tags, self._tags_field)
 
         req_kw_filter: Filter | None = None
         if req.keywords is not None:
-            req_kw_filter = self._bool_to_filter(req.keywords, "text")
+            req_kw_filter = self._bool_to_filter(req.keywords, self._text_field)
 
-        req_lim = req.lim or DEFAULT_LIMIT
+        req_lim = req.lim or self._default_limit
 
         # ----------------------------------------------------------------
         # No prefetch
@@ -214,37 +278,37 @@ class QueryExecutor:
                     neg_vec = self._encode(req.sem.negative)  # type: ignore[union-attr]
                     query = RecommendQuery(positive=[vec], negative=[neg_vec])
                 result = self._client.query_points(
-                    collection_name=COLLECTION_NAME,
+                    collection_name=self._collection_name,
                     query=query,
                     query_filter=req_tags_filter,
                     limit=req_lim,
                 )
                 payloads = [p.payload or {} for p in result.points]
-                return self._extract_ids(payloads)
+                return self._extract_results(payloads)
 
             # req kind == "keywords"
             combined = self._merge_filters(req_kw_filter, req_tags_filter)
             records, _ = self._client.scroll(
-                collection_name=COLLECTION_NAME,
+                collection_name=self._collection_name,
                 scroll_filter=combined,
                 limit=req_lim,
                 with_payload=True,
             )
             payloads = [r.payload or {} for r in records]
-            return self._extract_ids(payloads)
+            return self._extract_results(payloads)
 
         # ----------------------------------------------------------------
         # Build prefetch filters
         # ----------------------------------------------------------------
         pre_tags_filter: Filter | None = None
         if pre.tags is not None:
-            pre_tags_filter = self._bool_to_filter(pre.tags, "tags")
+            pre_tags_filter = self._bool_to_filter(pre.tags, self._tags_field)
 
         pre_kw_filter: Filter | None = None
         if pre.keywords is not None:
-            pre_kw_filter = self._bool_to_filter(pre.keywords, "text")
+            pre_kw_filter = self._bool_to_filter(pre.keywords, self._text_field)
 
-        pre_lim = pre.lim or DEFAULT_PRE_LIMIT
+        pre_lim = pre.lim or self._default_pre_limit
 
         # ----------------------------------------------------------------
         # pre: sem + req: sem
@@ -263,7 +327,7 @@ class QueryExecutor:
                 req_query = RecommendQuery(positive=[req_vec], negative=[req_neg_vec])
 
             result = self._client.query_points(
-                collection_name=COLLECTION_NAME,
+                collection_name=self._collection_name,
                 prefetch=Prefetch(
                     query=pre_query,
                     query_filter=pre_tags_filter,
@@ -274,7 +338,7 @@ class QueryExecutor:
                 limit=req_lim,
             )
             payloads = [p.payload or {} for p in result.points]
-            return self._extract_ids(payloads)
+            return self._extract_results(payloads)
 
         # ----------------------------------------------------------------
         # pre: sem + req: keywords
@@ -287,7 +351,7 @@ class QueryExecutor:
                 pre_q = RecommendQuery(positive=[pre_vec], negative=[pre_neg_vec])
 
             pre_result = self._client.query_points(
-                collection_name=COLLECTION_NAME,
+                collection_name=self._collection_name,
                 query=pre_q,
                 query_filter=pre_tags_filter,
                 limit=pre_lim,
@@ -300,13 +364,13 @@ class QueryExecutor:
                 id_filter, self._merge_filters(req_kw_filter, req_tags_filter)
             )
             records, _ = self._client.scroll(
-                collection_name=COLLECTION_NAME,
+                collection_name=self._collection_name,
                 scroll_filter=combined,
                 limit=req_lim,
                 with_payload=True,
             )
             payloads = [r.payload or {} for r in records]
-            return self._extract_ids(payloads)
+            return self._extract_results(payloads)
 
         # ----------------------------------------------------------------
         # pre: keywords + req: sem
@@ -314,7 +378,7 @@ class QueryExecutor:
         if pre.kind == "keywords" and req.kind == "sem":
             pre_combined = self._merge_filters(pre_kw_filter, pre_tags_filter)
             pre_records, _ = self._client.scroll(
-                collection_name=COLLECTION_NAME,
+                collection_name=self._collection_name,
                 scroll_filter=pre_combined,
                 limit=1000,
                 with_payload=False,
@@ -332,13 +396,13 @@ class QueryExecutor:
                 req_q = RecommendQuery(positive=[req_vec], negative=[req_neg_vec])
 
             result = self._client.query_points(
-                collection_name=COLLECTION_NAME,
+                collection_name=self._collection_name,
                 query=req_q,
                 query_filter=combined_filter,
                 limit=req_lim,
             )
             payloads = [p.payload or {} for p in result.points]
-            return self._extract_ids(payloads)
+            return self._extract_results(payloads)
 
         # ----------------------------------------------------------------
         # pre: keywords + req: keywords
@@ -348,10 +412,10 @@ class QueryExecutor:
             self._merge_filters(req_kw_filter, req_tags_filter),
         )
         records, _ = self._client.scroll(
-            collection_name=COLLECTION_NAME,
+            collection_name=self._collection_name,
             scroll_filter=combined,
             limit=req_lim,
             with_payload=True,
         )
         payloads = [r.payload or {} for r in records]
-        return self._extract_ids(payloads)
+        return self._extract_results(payloads)

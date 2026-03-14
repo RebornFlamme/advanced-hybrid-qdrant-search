@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app import app
+from examples.dash_app import app
 
 
 def main() -> None:

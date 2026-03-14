@@ -1,15 +1,34 @@
 [project]
 name = "qdrant-advanced-search"
 version = "0.1.0"
-description = "Add your description here"
+description = "Advanced query language for Qdrant: semantic, keyword, prefetch, tags"
 readme = "README.md"
 requires-python = ">=3.10"
+license = {text = "MIT"}
+keywords = ["qdrant", "search", "semantic", "nlp", "vector-search"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
-    "dash>=4.0.0",
-    "datasets>=4.7.0",
-    "numpy>=2.2.6",
-    "pandas>=2.3.3",
-    "pyarrow>=23.0.1",
     "qdrant-client>=1.17.1",
     "sentence-transformers>=5.3.0",
+]
+
+[project.optional-dependencies]
+app = ["dash>=4.0.0"]
+dev = ["datasets>=3.0.0", "pandas>=2.0.0", "pyarrow>=14.0.0", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qdrant_advanced_search"]
+
+[tool.uv]
+dev-dependencies = [
+    "hatchling>=1.29.0",
+    "ruff",
 ]

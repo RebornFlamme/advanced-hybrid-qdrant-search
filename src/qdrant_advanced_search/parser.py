@@ -137,8 +137,6 @@ TT_QUOTED = "QUOTED"
 TT_NUMBER = "NUMBER"
 TT_WORD = "WORD"
 
-# Tokens that signal the end of a clause
-_CLAUSE_STOPS = {TT_LIM_COLON, TT_TAGS_COLON, TT_REQ_COLON}
 
 _TOKEN_PATTERNS: list[tuple[str, str]] = [
     (TT_C_COLON, r"c:"),
@@ -469,7 +467,9 @@ def _parse_req(stream: _Stream) -> ReqClause:
             sem = SemExpr(positive=positive)
             kind = "sem"
         else:
-            raise ValueError(f"Expected sem:, keywords:, or quoted string after req:, got {tok!r}")
+            raise ValueError(
+                f"Expected sem:, keywords:, or quoted string after req:, got {tok!r}"
+            )
 
     # Optional lim:
     nxt = stream.peek()

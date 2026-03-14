@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(uv add:*)",
+      "Bash(uv run:*)"
     ]
   }
 }
