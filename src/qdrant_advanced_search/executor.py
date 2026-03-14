@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
-
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     FieldCondition,
@@ -24,26 +21,6 @@ from qdrant_advanced_search.parser import (
     SimpleQuery,
     parse_query,
 )
-
-
-@dataclass
-class SearchResult:
-    """A single search result with document metadata.
-
-    Attributes:
-        document_id: The parent document identifier.
-        paragraph_id: The matched paragraph identifier.
-        tags: Tag string for the document (e.g. "#SPORT, #NATURE").
-        paragraph_text: The text of the matched paragraph.
-        document_text: Full document text from the parquet file, or empty string
-            if no parquet was provided.
-    """
-
-    document_id: int
-    paragraph_id: int
-    tags: str
-    paragraph_text: str
-    document_text: str = field(default="")
 
 
 # ---------------------------------------------------------------------------
@@ -69,9 +46,6 @@ class QueryExecutor:
         tags_field: str = "tags",
         document_id_field: str = "document_id",
         paragraph_id_field: str = "paragraph_id",
-        parquet_path: str | Path | None = None,
-        parquet_document_id_col: str = "document_id",
-        parquet_text_col: str = "text",
         default_limit: int = 50,
         default_pre_limit: int = 50,
     ) -> None:
@@ -88,10 +62,6 @@ class QueryExecutor:
             tags_field: Payload field containing the tag string.
             document_id_field: Payload field containing the document identifier.
             paragraph_id_field: Payload field containing the paragraph identifier.
-            parquet_path: Optional path to a parquet file with full document texts.
-                When provided, ``SearchResult.document_text`` is populated.
-            parquet_document_id_col: Column name for document IDs in the parquet file.
-            parquet_text_col: Column name for full text in the parquet file.
             default_limit: Default result limit for main queries.
             default_pre_limit: Default result limit for prefetch queries.
         """
@@ -109,32 +79,21 @@ class QueryExecutor:
         self._default_limit = default_limit
         self._default_pre_limit = default_pre_limit
 
-        self._doc_texts: dict[int, str] = {}
-        if parquet_path is not None:
-            self._doc_texts = self._load_parquet(
-                Path(parquet_path), parquet_document_id_col, parquet_text_col
-            )
-
         self._ensure_indexes()
 
-    @staticmethod
-    def _load_parquet(
-        path: Path, id_col: str, text_col: str
-    ) -> dict[int, str]:
-        """Load a parquet file and return a mapping of document_id → full text.
+    # ------------------------------------------------------------------
+    # Public properties
+    # ------------------------------------------------------------------
 
-        Args:
-            path: Path to the parquet file.
-            id_col: Column name for document IDs.
-            text_col: Column name for document texts.
+    @property
+    def client(self) -> QdrantClient:
+        """The underlying QdrantClient instance."""
+        return self._client
 
-        Returns:
-            Dict mapping document ID (int) to full text string.
-        """
-        import pandas as pd  # optional dependency
-
-        df = pd.read_parquet(path, columns=[id_col, text_col])
-        return {int(row[id_col]): str(row[text_col]) for _, row in df.iterrows()}
+    @property
+    def collection_name(self) -> str:
+        """The Qdrant collection being searched."""
+        return self._collection_name
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -207,49 +166,38 @@ class QueryExecutor:
             return f1
         return Filter(must=[f1, f2])
 
-    def _extract_results(self, payload_list: list[dict]) -> list[SearchResult]:
-        """Build deduplicated SearchResult objects from a list of payloads.
-
-        One result per document_id, keeping the first (highest-ranked) paragraph.
+    def _extract_ids(self, payload_list: list[dict]) -> list[int]:
+        """Extract deduplicated document IDs from a list of payloads.
 
         Args:
             payload_list: List of payload dicts from Qdrant points.
 
         Returns:
-            Deduplicated list of SearchResult preserving result order.
+            Deduplicated list of document IDs preserving result order.
         """
         seen: set[int] = set()
-        results: list[SearchResult] = []
+        ids: list[int] = []
         for p in payload_list:
             if not p or self._document_id_field not in p:
                 continue
             doc_id = int(p[self._document_id_field])
-            if doc_id in seen:
-                continue
-            seen.add(doc_id)
-            results.append(
-                SearchResult(
-                    document_id=doc_id,
-                    paragraph_id=int(p.get(self._paragraph_id_field, 0)),
-                    tags=p.get(self._tags_field, ""),
-                    paragraph_text=p.get(self._text_field, ""),
-                    document_text=self._doc_texts.get(doc_id, ""),
-                )
-            )
-        return results
+            if doc_id not in seen:
+                seen.add(doc_id)
+                ids.append(doc_id)
+        return ids
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
-    def execute(self, raw_query: str) -> list[SearchResult]:
+    def execute(self, raw_query: str) -> list[int]:
         """Parse and execute a raw query string.
 
         Args:
             raw_query: The user's raw query string.
 
         Returns:
-            A deduplicated list of SearchResult matching the query, preserving
+            A deduplicated list of document IDs matching the query, preserving
             result order.
         """
         parsed = parse_query(raw_query)
@@ -261,14 +209,14 @@ class QueryExecutor:
     # Simple query
     # ------------------------------------------------------------------
 
-    def _run_simple(self, q: SimpleQuery) -> list[SearchResult]:
+    def _run_simple(self, q: SimpleQuery) -> list[int]:
         """Execute a plain semantic search query.
 
         Args:
             q: The SimpleQuery to execute.
 
         Returns:
-            List of SearchResult objects.
+            List of document IDs.
         """
         vec = self._encode(q.text)
         result = self._client.query_points(
@@ -276,26 +224,24 @@ class QueryExecutor:
             query=vec,
             limit=self._default_limit,
         )
-        payloads = [p.payload or {} for p in result.points]
-        return self._extract_results(payloads)
+        return self._extract_ids([p.payload or {} for p in result.points])
 
     # ------------------------------------------------------------------
     # Complex query
     # ------------------------------------------------------------------
 
-    def _run_complex(self, q: ComplexQuery) -> list[SearchResult]:
+    def _run_complex(self, q: ComplexQuery) -> list[int]:
         """Execute a complex structured query with optional prefetch.
 
         Args:
             q: The ComplexQuery to execute.
 
         Returns:
-            Deduplicated list of SearchResult preserving result order.
+            Deduplicated list of document IDs preserving result order.
         """
         pre = q.prefetch
         req = q.req
 
-        # Build req filters
         req_tags_filter: Filter | None = None
         if req.tags is not None:
             req_tags_filter = self._bool_to_filter(req.tags, self._tags_field)
@@ -322,10 +268,8 @@ class QueryExecutor:
                     query_filter=req_tags_filter,
                     limit=req_lim,
                 )
-                payloads = [p.payload or {} for p in result.points]
-                return self._extract_results(payloads)
+                return self._extract_ids([p.payload or {} for p in result.points])
 
-            # req kind == "keywords"
             combined = self._merge_filters(req_kw_filter, req_tags_filter)
             records, _ = self._client.scroll(
                 collection_name=self._collection_name,
@@ -333,8 +277,7 @@ class QueryExecutor:
                 limit=req_lim,
                 with_payload=True,
             )
-            payloads = [r.payload or {} for r in records]
-            return self._extract_results(payloads)
+            return self._extract_ids([r.payload or {} for r in records])
 
         # ----------------------------------------------------------------
         # Build prefetch filters
@@ -376,8 +319,7 @@ class QueryExecutor:
                 query_filter=req_tags_filter,
                 limit=req_lim,
             )
-            payloads = [p.payload or {} for p in result.points]
-            return self._extract_results(payloads)
+            return self._extract_ids([p.payload or {} for p in result.points])
 
         # ----------------------------------------------------------------
         # pre: sem + req: keywords
@@ -408,8 +350,7 @@ class QueryExecutor:
                 limit=req_lim,
                 with_payload=True,
             )
-            payloads = [r.payload or {} for r in records]
-            return self._extract_results(payloads)
+            return self._extract_ids([r.payload or {} for r in records])
 
         # ----------------------------------------------------------------
         # pre: keywords + req: sem
@@ -440,8 +381,7 @@ class QueryExecutor:
                 query_filter=combined_filter,
                 limit=req_lim,
             )
-            payloads = [p.payload or {} for p in result.points]
-            return self._extract_results(payloads)
+            return self._extract_ids([p.payload or {} for p in result.points])
 
         # ----------------------------------------------------------------
         # pre: keywords + req: keywords
@@ -456,5 +396,4 @@ class QueryExecutor:
             limit=req_lim,
             with_payload=True,
         )
-        payloads = [r.payload or {} for r in records]
-        return self._extract_results(payloads)
+        return self._extract_ids([r.payload or {} for r in records])

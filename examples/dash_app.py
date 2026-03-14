@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import dash
 from dash import Input, Output, dcc, html
+from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-from qdrant_advanced_search import QueryExecutor, SearchResult
+from qdrant_advanced_search import QueryExecutor
 
 # ---------------------------------------------------------------------------
 # Module-level executor (model loads once at import time)
@@ -97,6 +98,37 @@ app.layout = html.Div(
 # ---------------------------------------------------------------------------
 
 
+def _fetch_payloads(doc_ids: list[int]) -> dict[int, dict]:
+    """Fetch one paragraph payload per document ID from Qdrant.
+
+    Args:
+        doc_ids: List of document IDs to fetch.
+
+    Returns:
+        Mapping of document_id to its first matching payload dict.
+    """
+    if not doc_ids:
+        return {}
+    records, _ = executor.client.scroll(
+        collection_name=executor.collection_name,
+        scroll_filter=Filter(
+            should=[
+                FieldCondition(key="document_id", match=MatchValue(value=doc_id))
+                for doc_id in doc_ids
+            ]
+        ),
+        limit=len(doc_ids) * 10,
+        with_payload=True,
+    )
+    payloads: dict[int, dict] = {}
+    for r in records:
+        if r.payload:
+            did = int(r.payload.get("document_id", -1))
+            if did in doc_ids and did not in payloads:
+                payloads[did] = r.payload
+    return payloads
+
+
 def _tag_chips(tags_str: str) -> list[html.Span]:
     """Convert a tags string into a list of styled chip spans.
 
@@ -115,24 +147,25 @@ def _tag_chips(tags_str: str) -> list[html.Span]:
     ]
 
 
-def _result_card(rank: int, result: SearchResult) -> html.Div:
-    """Build a result card for a single SearchResult.
+def _result_card(rank: int, doc_id: int, payload: dict) -> html.Div:
+    """Build a result card for a single document.
 
     Args:
         rank: 1-based rank position.
-        result: The SearchResult to display.
+        doc_id: The document ID.
+        payload: Qdrant payload dict for one paragraph of this document.
 
     Returns:
         An html.Div card component.
     """
-    snippet = result.paragraph_text[:400] + (
-        "\u2026" if len(result.paragraph_text) > 400 else ""
-    )
+    paragraph_text = payload.get("text", "")
+    snippet = paragraph_text[:400] + ("…" if len(paragraph_text) > 400 else "")
+    tags_str = payload.get("tags", "")
+    paragraph_id = payload.get("paragraph_id", "")
 
     return html.Div(
         style=_CARD_STYLE,
         children=[
-            # Header row: rank + doc id + paragraph id
             html.Div(
                 style={
                     "display": "flex",
@@ -141,25 +174,13 @@ def _result_card(rank: int, result: SearchResult) -> html.Div:
                 },
                 children=[
                     html.Span(
-                        f"#{rank}  \u2014  Document {result.document_id}",
-                        style={
-                            "fontWeight": "700",
-                            "fontSize": "1rem",
-                            "color": "#1a1a2e",
-                        },
+                        f"#{rank}  —  Document {doc_id}",
+                        style={"fontWeight": "700", "fontSize": "1rem", "color": "#1a1a2e"},
                     ),
-                    html.Span(
-                        f"Paragraphe {result.paragraph_id}",
-                        style=_META_STYLE,
-                    ),
+                    html.Span(f"Paragraphe {paragraph_id}", style=_META_STYLE),
                 ],
             ),
-            # Tags
-            html.Div(
-                _tag_chips(result.tags),
-                style={"marginBottom": "10px"},
-            ),
-            # Paragraph snippet
+            html.Div(_tag_chips(tags_str), style={"marginBottom": "10px"}),
             html.P(
                 snippet,
                 style={
@@ -196,7 +217,7 @@ def update_results(query: str | None) -> html.Div:
         return html.Div()
 
     try:
-        results = executor.execute(query.strip())
+        doc_ids = executor.execute(query.strip())
     except Exception as exc:  # noqa: BLE001
         return html.Div(
             f"Erreur : {exc}",
@@ -209,22 +230,22 @@ def update_results(query: str | None) -> html.Div:
             },
         )
 
-    if not results:
+    if not doc_ids:
         return html.Div(
             "Aucun résultat.",
             style={"color": "#666", "fontStyle": "italic", "padding": "10px"},
         )
 
+    payloads = _fetch_payloads(doc_ids)
+
     count_label = html.P(
-        f"{len(results)} r\u00e9sultat{'s' if len(results) > 1 else ''}",
-        style={
-            "fontWeight": "700",
-            "marginBottom": "14px",
-            "color": "#444",
-            "fontSize": "0.95rem",
-        },
+        f"{len(doc_ids)} résultat{'s' if len(doc_ids) > 1 else ''}",
+        style={"fontWeight": "700", "marginBottom": "14px", "color": "#444", "fontSize": "0.95rem"},
     )
 
-    cards = [_result_card(i + 1, r) for i, r in enumerate(results)]
+    cards = [
+        _result_card(i + 1, doc_id, payloads.get(doc_id, {}))
+        for i, doc_id in enumerate(doc_ids)
+    ]
 
     return html.Div([count_label, *cards])

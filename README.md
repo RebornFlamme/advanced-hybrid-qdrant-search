@@ -21,6 +21,8 @@ uv add "qdrant-advanced-search[app]"
 
 ## Quick start
 
+`execute()` returns a deduplicated list of `document_id` integers, ranked by relevance. Fetching tags, text, or any other payload is the caller's responsibility.
+
 ```python
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
@@ -33,14 +35,10 @@ executor = QueryExecutor(
     client=client,
     model=model,
     collection_name="documents",
-    parquet_path="documents.parquet",
 )
 
-results = executor.execute('c: pre: sem: "plage" lim: 50 req: sem: "crème solaire"')
-for r in results:
-    print(r.document_id, r.tags)
-    print(r.paragraph_text[:120])
-    print(r.document_text[:300])
+doc_ids = executor.execute('c: pre: sem: "plage" lim: 50 req: sem: "crème solaire"')
+print(doc_ids)  # [42, 7, 91, ...]
 ```
 
 ---
@@ -57,17 +55,17 @@ A **complex query** must start with `c:` and supports the following clauses:
 | `pre: sem: "..."` | Semantic prefetch | `pre: sem: "plage"` |
 | `pre: sem: "..." lim: N` | Semantic prefetch with limit | `pre: sem: "plage" lim: 100` |
 | `pre: keywords: EXPR` | Keyword boolean prefetch | `pre: keywords: "plage" OR "vacances"` |
-| `req: "..."` | Bare semantic request (shorthand) | `req: "crème solaire"` |
+| `req: sem: "..."` | Semantic request | `req: sem: "crème solaire"` |
 | `req: sem: "..." NOT "..."` | Semantic request with negative example | `req: sem: "bronzage" NOT "piscine"` |
 | `req: keywords: EXPR` | Keyword boolean request | `req: keywords: "sport" AND NOT "foot"` |
 | `lim: N` | Result limit (on `req:` or `pre: sem:`) | `lim: 50` |
-| `tags: EXPR` | Tag filter (boolean expression on tag string) | `tags: "#SPORT" OR "#NATURE"` |
+| `tags: EXPR` | Tag filter (boolean, on `pre:` or `req:`) | `tags: #SPORT OR #NATURE` |
 
 ### Boolean expression syntax
 
 Inside `keywords:` and `tags:` clauses:
 
-- Terms are quoted strings `"word"` or bare words
+- Terms are quoted strings `"word"` or bare words (e.g. `#TAG`)
 - Operators (case-insensitive): `AND`, `OR`, `NOT`
 - Parentheses for grouping: `("plage" OR "vacances") AND NOT "sport"`
 
@@ -81,13 +79,13 @@ Victoire au superbowl
 c: pre: sem: "Il fait beau" lim: 50 req: sem: "Il fait chaud"
 
 # Keyword prefetch → semantic request
-c: pre: keywords: ("plage" OR "vacances") AND "sport" req: "Crème de bronzage" lim: 50
+c: pre: keywords: ("plage" OR "vacances") AND "sport" req: sem: "Crème de bronzage" lim: 50
 
 # Keyword prefetch with NOT → semantic request with negative example
 c: pre: keywords: ("plage" OR "vacances") AND NOT "sport" req: sem: "Crème de bronzage" NOT "Après soleil" lim: 50
 
 # Tag filtering
-c: req: sem: "football" tags: "#SPORT"
+c: req: sem: "football" tags: #SPORT
 ```
 
 ---
@@ -106,9 +104,6 @@ All `QueryExecutor.__init__` parameters are keyword-only with sensible defaults:
 | `tags_field` | `str` | `"tags"` | Payload field containing tag string |
 | `document_id_field` | `str` | `"document_id"` | Payload field for the document ID |
 | `paragraph_id_field` | `str` | `"paragraph_id"` | Payload field for the paragraph ID |
-| `parquet_path` | `str \| Path \| None` | `None` | Path to a parquet file with full document texts. When provided, `SearchResult.document_text` is populated |
-| `parquet_document_id_col` | `str` | `"document_id"` | Column name for document IDs in the parquet file |
-| `parquet_text_col` | `str` | `"text"` | Column name for full text in the parquet file |
 | `default_limit` | `int` | `50` | Default result limit for main queries |
 | `default_pre_limit` | `int` | `50` | Default result limit for prefetch queries |
 
@@ -122,23 +117,6 @@ model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 executor = QueryExecutor(model=model, collection_name="my_collection")
 ```
 
-Passing a parquet file enriches each `SearchResult` with the full document text:
-
-```python
-executor = QueryExecutor(
-    collection_name="my_collection",
-    parquet_path="documents.parquet",
-    parquet_document_id_col="document_id",  # default
-    parquet_text_col="text",                # default
-)
-
-results = executor.execute("alcène")
-for r in results:
-    print(r.document_id, r.tags)
-    print(r.paragraph_text)   # matched paragraph (from Qdrant payload)
-    print(r.document_text)    # full document text (from parquet)
-```
-
 ---
 
 ## Dash app
@@ -149,7 +127,7 @@ An example Dash application is provided in `examples/dash_app.py`. Install the `
 uv run python main.py
 ```
 
-The app starts a local development server at `http://127.0.0.1:8050` and provides a single text input that accepts both simple and complex query strings.
+The app starts a local development server at `http://127.0.0.1:8050` and provides a single text input that accepts both simple and complex query strings. It fetches payload data (tags, paragraph text) directly from Qdrant for display.
 
 To seed the Qdrant collection with French Wikipedia articles before running the app:
 
