@@ -22,16 +22,25 @@ uv add "qdrant-advanced-search[app]"
 ## Quick start
 
 ```python
+from qdrant_client import QdrantClient
+from sentence_transformers import SentenceTransformer
 from qdrant_advanced_search import QueryExecutor
 
+client = QdrantClient(url="http://localhost:6333")
+model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+
 executor = QueryExecutor(
-    qdrant_url="http://localhost:6333",
+    client=client,
+    model=model,
     collection_name="documents",
+    parquet_path="documents.parquet",
 )
 
 results = executor.execute('c: pre: sem: "plage" lim: 50 req: sem: "crème solaire"')
 for r in results:
-    print(r.document_id, r.tags, r.paragraph_text[:120])
+    print(r.document_id, r.tags)
+    print(r.paragraph_text[:120])
+    print(r.document_text[:300])
 ```
 
 ---
