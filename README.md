@@ -96,7 +96,7 @@ All `QueryExecutor.__init__` parameters are keyword-only with sensible defaults:
 | `tags_field` | `str` | `"tags"` | Payload field containing tag string |
 | `document_id_field` | `str` | `"document_id"` | Payload field for the document ID |
 | `paragraph_id_field` | `str` | `"paragraph_id"` | Payload field for the paragraph ID |
-| `default_limit` | `int` | `10` | Default result limit for main queries |
+| `default_limit` | `int` | `50` | Default result limit for main queries |
 | `default_pre_limit` | `int` | `50` | Default result limit for prefetch queries |
 
 Passing an already-loaded `SentenceTransformer` instance avoids loading the model twice:

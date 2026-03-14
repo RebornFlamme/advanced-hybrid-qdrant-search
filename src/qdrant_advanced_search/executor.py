@@ -64,7 +64,7 @@ class QueryExecutor:
         tags_field: str = "tags",
         document_id_field: str = "document_id",
         paragraph_id_field: str = "paragraph_id",
-        default_limit: int = 10,
+        default_limit: int = 50,
         default_pre_limit: int = 50,
     ) -> None:
         """Initialise the model, Qdrant client, and payload indexes.
