@@ -159,13 +159,13 @@ TT_NUMBER = "NUMBER"
 TT_WORD = "WORD"
 
 _TOKEN_PATTERNS: list[tuple[str, str]] = [
-    (TT_C_COLON, r"c:"),
-    (TT_PRE_COLON, r"pre:"),
-    (TT_REQ_COLON, r"req:"),
-    (TT_SEM_COLON, r"sem:"),
-    (TT_KEYWORDS_COLON, r"keywords:"),
-    (TT_LIM_COLON, r"lim:"),
-    (TT_FILTER_COLON, r"filter:"),
+    (TT_C_COLON, r"c\s*:"),
+    (TT_PRE_COLON, r"pre\s*:"),
+    (TT_REQ_COLON, r"req\s*:"),
+    (TT_SEM_COLON, r"sem\s*:"),
+    (TT_KEYWORDS_COLON, r"keywords\s*:"),
+    (TT_LIM_COLON, r"lim\s*:"),
+    (TT_FILTER_COLON, r"filter\s*:"),
     (TT_AND, r"AND(?=[\s()\"\[])"),
     (TT_OR, r"OR(?=[\s()\"\[])"),
     (TT_NOT, r"NOT(?=[\s()\"\[])"),
@@ -635,6 +635,12 @@ def parse_query(text: str) -> SimpleQuery | ComplexQuery:
     prefetch: PrefetchClause | None = None
     if (nxt := stream.peek()) and nxt.type == TT_PRE_COLON:
         prefetch = _parse_prefetch(stream)
+
+    if stream.at_end() or (stream.peek() and stream.peek().type != TT_REQ_COLON):  # type: ignore[union-attr]
+        raise ValueError(
+            "Une requête complexe (c:) doit contenir une clause req:. "
+            "Exemple : c: pre: keywords: \"alcene\" req: sem: \"structure\""
+        )
 
     req = _parse_req(stream)
     return ComplexQuery(prefetch=prefetch, req=req)
