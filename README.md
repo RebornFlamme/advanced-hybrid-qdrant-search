@@ -89,7 +89,8 @@ All `QueryExecutor.__init__` parameters are keyword-only with sensible defaults:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `qdrant_url` | `str` | `"http://localhost:6333"` | URL of the Qdrant instance |
+| `qdrant_url` | `str` | `"http://localhost:6333"` | URL of the Qdrant instance (ignored if `client` is passed) |
+| `client` | `QdrantClient \| None` | `None` | An already-instantiated `QdrantClient` |
 | `collection_name` | `str` | `"documents"` | Qdrant collection to search |
 | `model` | `str \| SentenceTransformer` | `"paraphrase-multilingual-MiniLM-L12-v2"` | Model name or loaded instance |
 | `text_field` | `str` | `"text"` | Payload field containing paragraph text |

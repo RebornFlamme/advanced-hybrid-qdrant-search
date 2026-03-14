@@ -58,6 +58,7 @@ class QueryExecutor:
         self,
         *,
         qdrant_url: str = "http://localhost:6333",
+        client: QdrantClient | None = None,
         collection_name: str = "documents",
         model: str | SentenceTransformer = "paraphrase-multilingual-MiniLM-L12-v2",
         text_field: str = "text",
@@ -70,7 +71,9 @@ class QueryExecutor:
         """Initialise the model, Qdrant client, and payload indexes.
 
         Args:
-            qdrant_url: URL of the Qdrant instance.
+            qdrant_url: URL of the Qdrant instance. Ignored if ``client`` is provided.
+            client: An already-instantiated QdrantClient. If provided, ``qdrant_url``
+                is ignored.
             collection_name: Name of the Qdrant collection to search.
             model: Either a model name string or an already-loaded
                 SentenceTransformer instance.
@@ -86,7 +89,7 @@ class QueryExecutor:
         else:
             self._model = model
 
-        self._qdrant_url = qdrant_url
+        self._client = client if client is not None else QdrantClient(url=qdrant_url)
         self._collection_name = collection_name
         self._text_field = text_field
         self._tags_field = tags_field
@@ -95,7 +98,6 @@ class QueryExecutor:
         self._default_limit = default_limit
         self._default_pre_limit = default_pre_limit
 
-        self._client = QdrantClient(url=qdrant_url)
         self._ensure_indexes()
 
     # ------------------------------------------------------------------
