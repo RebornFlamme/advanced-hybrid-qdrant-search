@@ -97,6 +97,9 @@ All `QueryExecutor.__init__` parameters are keyword-only with sensible defaults:
 | `tags_field` | `str` | `"tags"` | Payload field containing tag string |
 | `document_id_field` | `str` | `"document_id"` | Payload field for the document ID |
 | `paragraph_id_field` | `str` | `"paragraph_id"` | Payload field for the paragraph ID |
+| `parquet_path` | `str \| Path \| None` | `None` | Path to a parquet file with full document texts. When provided, `SearchResult.document_text` is populated |
+| `parquet_document_id_col` | `str` | `"document_id"` | Column name for document IDs in the parquet file |
+| `parquet_text_col` | `str` | `"text"` | Column name for full text in the parquet file |
 | `default_limit` | `int` | `50` | Default result limit for main queries |
 | `default_pre_limit` | `int` | `50` | Default result limit for prefetch queries |
 
@@ -108,6 +111,23 @@ from qdrant_advanced_search import QueryExecutor
 
 model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 executor = QueryExecutor(model=model, collection_name="my_collection")
+```
+
+Passing a parquet file enriches each `SearchResult` with the full document text:
+
+```python
+executor = QueryExecutor(
+    collection_name="my_collection",
+    parquet_path="documents.parquet",
+    parquet_document_id_col="document_id",  # default
+    parquet_text_col="text",                # default
+)
+
+results = executor.execute("alcène")
+for r in results:
+    print(r.document_id, r.tags)
+    print(r.paragraph_text)   # matched paragraph (from Qdrant payload)
+    print(r.document_text)    # full document text (from parquet)
 ```
 
 ---
