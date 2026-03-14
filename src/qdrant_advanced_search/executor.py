@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -34,12 +35,15 @@ class SearchResult:
         paragraph_id: The matched paragraph identifier.
         tags: Tag string for the document (e.g. "#SPORT, #NATURE").
         paragraph_text: The text of the matched paragraph.
+        document_text: Full document text from the parquet file, or empty string
+            if no parquet was provided.
     """
 
     document_id: int
     paragraph_id: int
     tags: str
     paragraph_text: str
+    document_text: str = field(default="")
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +69,9 @@ class QueryExecutor:
         tags_field: str = "tags",
         document_id_field: str = "document_id",
         paragraph_id_field: str = "paragraph_id",
+        parquet_path: str | Path | None = None,
+        parquet_document_id_col: str = "document_id",
+        parquet_text_col: str = "text",
         default_limit: int = 50,
         default_pre_limit: int = 50,
     ) -> None:
@@ -81,6 +88,10 @@ class QueryExecutor:
             tags_field: Payload field containing the tag string.
             document_id_field: Payload field containing the document identifier.
             paragraph_id_field: Payload field containing the paragraph identifier.
+            parquet_path: Optional path to a parquet file with full document texts.
+                When provided, ``SearchResult.document_text`` is populated.
+            parquet_document_id_col: Column name for document IDs in the parquet file.
+            parquet_text_col: Column name for full text in the parquet file.
             default_limit: Default result limit for main queries.
             default_pre_limit: Default result limit for prefetch queries.
         """
@@ -98,7 +109,32 @@ class QueryExecutor:
         self._default_limit = default_limit
         self._default_pre_limit = default_pre_limit
 
+        self._doc_texts: dict[int, str] = {}
+        if parquet_path is not None:
+            self._doc_texts = self._load_parquet(
+                Path(parquet_path), parquet_document_id_col, parquet_text_col
+            )
+
         self._ensure_indexes()
+
+    @staticmethod
+    def _load_parquet(
+        path: Path, id_col: str, text_col: str
+    ) -> dict[int, str]:
+        """Load a parquet file and return a mapping of document_id → full text.
+
+        Args:
+            path: Path to the parquet file.
+            id_col: Column name for document IDs.
+            text_col: Column name for document texts.
+
+        Returns:
+            Dict mapping document ID (int) to full text string.
+        """
+        import pandas as pd  # optional dependency
+
+        df = pd.read_parquet(path, columns=[id_col, text_col])
+        return {int(row[id_col]): str(row[text_col]) for _, row in df.iterrows()}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -197,6 +233,7 @@ class QueryExecutor:
                     paragraph_id=int(p.get(self._paragraph_id_field, 0)),
                     tags=p.get(self._tags_field, ""),
                     paragraph_text=p.get(self._text_field, ""),
+                    document_text=self._doc_texts.get(doc_id, ""),
                 )
             )
         return results
