@@ -60,6 +60,8 @@ A **complex query** must start with `c:` and supports the following clauses:
 | `req: keywords: EXPR` | Keyword boolean request | `req: keywords: "sport" AND NOT "foot"` |
 | `lim: N` | Result limit (on `req:` or `pre: sem:`) | `lim: 50` |
 | `tags: EXPR` | Tag filter (boolean, on `pre:` or `req:`) | `tags: #SPORT OR #NATURE` |
+| `filter: field IN [v, ...]` | Payload field inclusion filter | `filter: category IN ["sport"]` |
+| `filter: field NOT IN [v, ...]` | Payload field exclusion filter | `filter: year NOT IN [2020]` |
 
 ### Boolean expression syntax
 
@@ -69,11 +71,23 @@ Inside `keywords:` and `tags:` clauses:
 - Operators (case-insensitive): `AND`, `OR`, `NOT`
 - Parentheses for grouping: `("plage" OR "vacances") AND NOT "sport"`
 
+### Payload filter syntax
+
+`filter:` applies exact-value matching on any Qdrant payload field. It can be placed on `pre:`, `req:`, or a simple query. Multiple `filter:` clauses are combined with AND.
+
+- `field` — exact payload field name
+- Values — quoted strings `"val"` or integers `42`, comma-separated
+- `IN` — keep only matching documents
+- `NOT IN` — exclude matching documents
+
 ### Full examples
 
 ```
 # Simple semantic search
 Victoire au superbowl
+
+# Simple search restricted to a category
+Recettes de cuisine filter: category IN ["gastronomie", "végétarien"]
 
 # Semantic prefetch → semantic request
 c: pre: sem: "Il fait beau" lim: 50 req: sem: "Il fait chaud"
@@ -86,6 +100,15 @@ c: pre: keywords: ("plage" OR "vacances") AND NOT "sport" req: sem: "Crème de b
 
 # Tag filtering
 c: req: sem: "football" tags: #SPORT
+
+# Payload filter on req — exclude specific documents
+c: req: sem: "alcène" filter: document_id NOT IN [12, 45] lim: 20
+
+# Payload filter on pre and req — different fields
+c: pre: sem: "nutrition" lim: 100 filter: year IN [2022, 2023] req: sem: "protéines" filter: category NOT IN ["publicité"] lim: 30
+
+# Multiple filters combined (AND)
+c: req: sem: "intelligence artificielle" filter: category IN ["science"] filter: year NOT IN [2020] lim: 25
 ```
 
 ---

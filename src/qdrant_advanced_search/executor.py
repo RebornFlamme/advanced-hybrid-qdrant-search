@@ -7,6 +7,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     HasIdCondition,
+    MatchAny,
     MatchText,
     PayloadSchemaType,
     Prefetch,
@@ -17,6 +18,7 @@ from sentence_transformers import SentenceTransformer
 from qdrant_advanced_search.parser import (
     BoolNode,
     ComplexQuery,
+    FilterClause,
     Literal,
     SimpleQuery,
     parse_query,
@@ -150,6 +152,29 @@ class QueryExecutor:
         return Filter(should=[left_filter, right_filter])
 
     @staticmethod
+    def _filter_clauses_to_filter(clauses: list[FilterClause]) -> Filter | None:
+        """Convert a list of FilterClause objects into a Qdrant Filter (AND of all).
+
+        Args:
+            clauses: List of payload field filter clauses.
+
+        Returns:
+            A combined Filter, or None if the list is empty.
+        """
+        if not clauses:
+            return None
+        conditions: list[Filter] = []
+        for clause in clauses:
+            cond = FieldCondition(key=clause.field, match=MatchAny(any=clause.values))
+            if clause.exclude:
+                conditions.append(Filter(must_not=[cond]))
+            else:
+                conditions.append(Filter(must=[cond]))
+        if len(conditions) == 1:
+            return conditions[0]
+        return Filter(must=conditions)
+
+    @staticmethod
     def _merge_filters(f1: Filter | None, f2: Filter | None) -> Filter | None:
         """Combine two filters with an AND relationship.
 
@@ -219,9 +244,11 @@ class QueryExecutor:
             List of document IDs.
         """
         vec = self._encode(q.text)
+        query_filter = self._filter_clauses_to_filter(q.filters)
         result = self._client.query_points(
             collection_name=self._collection_name,
             query=vec,
+            query_filter=query_filter,
             limit=self._default_limit,
         )
         return self._extract_ids([p.payload or {} for p in result.points])
@@ -246,6 +273,9 @@ class QueryExecutor:
         if req.tags is not None:
             req_tags_filter = self._bool_to_filter(req.tags, self._tags_field)
 
+        req_payload_filter = self._filter_clauses_to_filter(req.filters)
+        req_base_filter = self._merge_filters(req_tags_filter, req_payload_filter)
+
         req_kw_filter: Filter | None = None
         if req.keywords is not None:
             req_kw_filter = self._bool_to_filter(req.keywords, self._text_field)
@@ -265,12 +295,12 @@ class QueryExecutor:
                 result = self._client.query_points(
                     collection_name=self._collection_name,
                     query=query,
-                    query_filter=req_tags_filter,
+                    query_filter=req_base_filter,
                     limit=req_lim,
                 )
                 return self._extract_ids([p.payload or {} for p in result.points])
 
-            combined = self._merge_filters(req_kw_filter, req_tags_filter)
+            combined = self._merge_filters(req_kw_filter, req_base_filter)
             records, _ = self._client.scroll(
                 collection_name=self._collection_name,
                 scroll_filter=combined,
@@ -285,6 +315,9 @@ class QueryExecutor:
         pre_tags_filter: Filter | None = None
         if pre.tags is not None:
             pre_tags_filter = self._bool_to_filter(pre.tags, self._tags_field)
+
+        pre_payload_filter = self._filter_clauses_to_filter(pre.filters)
+        pre_base_filter = self._merge_filters(pre_tags_filter, pre_payload_filter)
 
         pre_kw_filter: Filter | None = None
         if pre.keywords is not None:
@@ -312,11 +345,11 @@ class QueryExecutor:
                 collection_name=self._collection_name,
                 prefetch=Prefetch(
                     query=pre_query,
-                    query_filter=pre_tags_filter,
+                    query_filter=pre_base_filter,
                     limit=pre_lim,
                 ),
                 query=req_query,
-                query_filter=req_tags_filter,
+                query_filter=req_base_filter,
                 limit=req_lim,
             )
             return self._extract_ids([p.payload or {} for p in result.points])
@@ -334,7 +367,7 @@ class QueryExecutor:
             pre_result = self._client.query_points(
                 collection_name=self._collection_name,
                 query=pre_q,
-                query_filter=pre_tags_filter,
+                query_filter=pre_base_filter,
                 limit=pre_lim,
             )
             pre_ids: list[str] = [p.id for p in pre_result.points]  # type: ignore[misc]
@@ -342,7 +375,7 @@ class QueryExecutor:
                 return []
             id_filter = Filter(must=[HasIdCondition(has_id=pre_ids)])
             combined = self._merge_filters(
-                id_filter, self._merge_filters(req_kw_filter, req_tags_filter)
+                id_filter, self._merge_filters(req_kw_filter, req_base_filter)
             )
             records, _ = self._client.scroll(
                 collection_name=self._collection_name,
@@ -356,7 +389,7 @@ class QueryExecutor:
         # pre: keywords + req: sem
         # ----------------------------------------------------------------
         if pre.kind == "keywords" and req.kind == "sem":
-            pre_combined = self._merge_filters(pre_kw_filter, pre_tags_filter)
+            pre_combined = self._merge_filters(pre_kw_filter, pre_base_filter)
             pre_records, _ = self._client.scroll(
                 collection_name=self._collection_name,
                 scroll_filter=pre_combined,
@@ -367,7 +400,7 @@ class QueryExecutor:
             if not pre_ids_kw:
                 return []
             id_filter = Filter(must=[HasIdCondition(has_id=pre_ids_kw)])
-            combined_filter = self._merge_filters(id_filter, req_tags_filter)
+            combined_filter = self._merge_filters(id_filter, req_base_filter)
 
             req_vec = self._encode(req.sem.positive)  # type: ignore[union-attr]
             req_q: list[float] | RecommendQuery = req_vec
@@ -387,8 +420,8 @@ class QueryExecutor:
         # pre: keywords + req: keywords
         # ----------------------------------------------------------------
         combined = self._merge_filters(
-            self._merge_filters(pre_kw_filter, pre_tags_filter),
-            self._merge_filters(req_kw_filter, req_tags_filter),
+            self._merge_filters(pre_kw_filter, pre_base_filter),
+            self._merge_filters(req_kw_filter, req_base_filter),
         )
         records, _ = self._client.scroll(
             collection_name=self._collection_name,

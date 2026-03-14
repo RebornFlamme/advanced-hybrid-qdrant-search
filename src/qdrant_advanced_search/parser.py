@@ -56,6 +56,21 @@ BoolNode = Literal | BoolOp
 
 
 @dataclass
+class FilterClause:
+    """A payload field filter clause.
+
+    Attributes:
+        field: Payload field name to filter on.
+        values: List of values to match (strings or integers).
+        exclude: If True, exclude matching documents (NOT IN). Default is IN.
+    """
+
+    field: str
+    values: list[str | int]
+    exclude: bool = False
+
+
+@dataclass
 class PrefetchClause:
     """Prefetch clause for a complex query.
 
@@ -65,6 +80,7 @@ class PrefetchClause:
         keywords: Boolean expression, present when kind == "keywords".
         lim: Optional limit for semantic prefetch.
         tags: Optional tag filter as a boolean expression.
+        filters: Optional list of payload field filters.
     """
 
     kind: str
@@ -72,6 +88,7 @@ class PrefetchClause:
     keywords: BoolNode | None = None
     lim: int | None = None
     tags: BoolNode | None = None
+    filters: list[FilterClause] = field(default_factory=list)
 
 
 @dataclass
@@ -84,6 +101,7 @@ class ReqClause:
         keywords: Boolean expression, present when kind == "keywords".
         lim: Optional result limit.
         tags: Optional tag filter as a boolean expression.
+        filters: Optional list of payload field filters.
     """
 
     kind: str
@@ -91,6 +109,7 @@ class ReqClause:
     keywords: BoolNode | None = None
     lim: int | None = None
     tags: BoolNode | None = None
+    filters: list[FilterClause] = field(default_factory=list)
 
 
 @dataclass
@@ -99,9 +118,11 @@ class SimpleQuery:
 
     Attributes:
         text: The raw search text.
+        filters: Optional list of payload field filters.
     """
 
     text: str
+    filters: list[FilterClause] = field(default_factory=list)
 
 
 @dataclass
@@ -128,15 +149,19 @@ TT_SEM_COLON = "SEM_COLON"
 TT_KEYWORDS_COLON = "KEYWORDS_COLON"
 TT_TAGS_COLON = "TAGS_COLON"
 TT_LIM_COLON = "LIM_COLON"
+TT_FILTER_COLON = "FILTER_COLON"
 TT_AND = "AND"
 TT_OR = "OR"
 TT_NOT = "NOT"
+TT_IN = "IN"
 TT_LPAREN = "LPAREN"
 TT_RPAREN = "RPAREN"
+TT_LBRACKET = "LBRACKET"
+TT_RBRACKET = "RBRACKET"
+TT_COMMA = "COMMA"
 TT_QUOTED = "QUOTED"
 TT_NUMBER = "NUMBER"
 TT_WORD = "WORD"
-
 
 _TOKEN_PATTERNS: list[tuple[str, str]] = [
     (TT_C_COLON, r"c:"),
@@ -146,20 +171,28 @@ _TOKEN_PATTERNS: list[tuple[str, str]] = [
     (TT_KEYWORDS_COLON, r"keywords:"),
     (TT_TAGS_COLON, r"tags:"),
     (TT_LIM_COLON, r"lim:"),
-    (TT_AND, r"AND(?=[\s()\"])"),
-    (TT_OR, r"OR(?=[\s()\"])"),
-    (TT_NOT, r"NOT(?=[\s()\"])"),
+    (TT_FILTER_COLON, r"filter:"),
+    (TT_AND, r"AND(?=[\s()\"\[])"),
+    (TT_OR, r"OR(?=[\s()\"\[])"),
+    (TT_NOT, r"NOT(?=[\s()\"\[])"),
+    (TT_IN, r"IN(?=[\s\[])"),
     (TT_LPAREN, r"\("),
     (TT_RPAREN, r"\)"),
+    (TT_LBRACKET, r"\["),
+    (TT_RBRACKET, r"\]"),
+    (TT_COMMA, r","),
     (TT_QUOTED, r'"[^"]*"'),
     (TT_NUMBER, r"\d+"),
-    (TT_WORD, r'[^\s()"]+'),
+    (TT_WORD, r'[^\s()\[\]",]+'),
 ]
 
 _MASTER_RE = re.compile(
     "|".join(f"(?P<{name}>{pattern})" for name, pattern in _TOKEN_PATTERNS),
     re.IGNORECASE,
 )
+
+# Tokens that mark the boundary of a bool expression (stop parsing)
+_BOOL_STOPS = {TT_LIM_COLON, TT_TAGS_COLON, TT_FILTER_COLON, TT_REQ_COLON}
 
 
 @dataclass
@@ -190,8 +223,7 @@ def _tokenize(text: str) -> list[Token]:
         if tt is None:
             continue
         if tt == TT_QUOTED:
-            raw = m.group(0)
-            val = raw[1:-1]  # strip surrounding double quotes
+            val = m.group(0)[1:-1]  # strip surrounding double quotes
         else:
             val = m.group(0)
         tokens.append(Token(type=tt, value=val))
@@ -260,7 +292,7 @@ class _Stream:
 
 
 # ---------------------------------------------------------------------------
-# Parser helpers
+# Boolean expression parser
 # ---------------------------------------------------------------------------
 
 
@@ -323,12 +355,8 @@ def _parse_not(stream: _Stream) -> BoolNode:
     if tok and tok.type == TT_NOT:
         stream.consume(TT_NOT)
         child = _parse_not(stream)
-        # Wrap single Literal in negated form; for BoolOp, wrap in Literal is
-        # not possible — represent as negated subtree via a special pattern
         if isinstance(child, Literal):
             return Literal(value=child.value, negated=not child.negated)
-        # For a BoolOp child, we can't flip it easily — wrap as-is and flag
-        # unsupported; in practice the grammar only uses NOT before literals
         return child
     return _parse_atom(stream)
 
@@ -360,6 +388,81 @@ def _parse_atom(stream: _Stream) -> BoolNode:
 
 
 # ---------------------------------------------------------------------------
+# Filter clause parser
+# ---------------------------------------------------------------------------
+
+
+def _parse_filter_clause(stream: _Stream) -> FilterClause:
+    """Parse a single filter: field IN [...] or filter: field NOT IN [...] clause.
+
+    Args:
+        stream: The token stream positioned at filter:.
+
+    Returns:
+        A FilterClause.
+
+    Raises:
+        ValueError: If the syntax is malformed.
+    """
+    stream.consume(TT_FILTER_COLON)
+
+    # Field name — accept any non-structural token
+    tok = stream.peek()
+    if tok is None or tok.type in _BOOL_STOPS | {TT_REQ_COLON}:
+        raise ValueError("Expected field name after filter:")
+    field_name = stream.consume().value
+
+    # IN or NOT IN
+    nxt = stream.peek()
+    if nxt and nxt.type == TT_NOT:
+        stream.consume(TT_NOT)
+        stream.consume(TT_IN)
+        exclude = True
+    elif nxt and nxt.type == TT_IN:
+        stream.consume(TT_IN)
+        exclude = False
+    else:
+        raise ValueError(f"Expected IN or NOT IN after field name '{field_name}', got {nxt!r}")
+
+    # [ value, value, ... ]
+    stream.consume(TT_LBRACKET)
+    values: list[str | int] = []
+    while True:
+        tok = stream.peek()
+        if tok is None or tok.type == TT_RBRACKET:
+            break
+        if tok.type == TT_QUOTED:
+            values.append(stream.consume(TT_QUOTED).value)
+        elif tok.type == TT_NUMBER:
+            values.append(int(stream.consume(TT_NUMBER).value))
+        elif tok.type == TT_WORD:
+            values.append(stream.consume(TT_WORD).value)
+        else:
+            break
+        # Optional comma separator
+        if (nxt := stream.peek()) and nxt.type == TT_COMMA:
+            stream.consume(TT_COMMA)
+
+    stream.consume(TT_RBRACKET)
+    return FilterClause(field=field_name, values=values, exclude=exclude)
+
+
+def _parse_filter_clauses(stream: _Stream) -> list[FilterClause]:
+    """Parse zero or more consecutive filter: clauses.
+
+    Args:
+        stream: The current token stream.
+
+    Returns:
+        List of FilterClause objects.
+    """
+    clauses: list[FilterClause] = []
+    while not stream.at_end() and (nxt := stream.peek()) and nxt.type == TT_FILTER_COLON:
+        clauses.append(_parse_filter_clause(stream))
+    return clauses
+
+
+# ---------------------------------------------------------------------------
 # Clause parsers
 # ---------------------------------------------------------------------------
 
@@ -382,13 +485,52 @@ def _parse_sem(stream: _Stream) -> SemExpr:
         raise ValueError("Expected quoted string after sem:")
     positive = stream.consume(TT_QUOTED).value
     negative: str | None = None
-    # Check for NOT "..."
     nxt = stream.peek()
     nxt2 = stream.peek(1)
     if nxt and nxt.type == TT_NOT and nxt2 and nxt2.type == TT_QUOTED:
         stream.consume(TT_NOT)
         negative = stream.consume(TT_QUOTED).value
     return SemExpr(positive=positive, negative=negative)
+
+
+def _parse_modifiers(
+    stream: _Stream,
+    *,
+    allow_lim: bool = True,
+    stop_at_req: bool = True,
+) -> tuple[int | None, BoolNode | None, list[FilterClause]]:
+    """Parse optional lim:, tags:, and filter: modifiers in any order.
+
+    Args:
+        stream: The current token stream.
+        allow_lim: Whether lim: is valid in this context.
+        stop_at_req: Whether to stop when req: is encountered.
+
+    Returns:
+        Tuple of (lim, tags, filters).
+    """
+    lim: int | None = None
+    tags: BoolNode | None = None
+    filters: list[FilterClause] = []
+
+    while not stream.at_end():
+        nxt = stream.peek()
+        if nxt is None:
+            break
+        if stop_at_req and nxt.type == TT_REQ_COLON:
+            break
+        if allow_lim and nxt.type == TT_LIM_COLON:
+            stream.consume(TT_LIM_COLON)
+            lim = int(stream.consume(TT_NUMBER).value)
+        elif nxt.type == TT_TAGS_COLON:
+            stream.consume(TT_TAGS_COLON)
+            tags = _parse_bool_expr(stream)
+        elif nxt.type == TT_FILTER_COLON:
+            filters.append(_parse_filter_clause(stream))
+        else:
+            break
+
+    return lim, tags, filters
 
 
 def _parse_prefetch(stream: _Stream) -> PrefetchClause:
@@ -405,33 +547,21 @@ def _parse_prefetch(stream: _Stream) -> PrefetchClause:
     """
     stream.consume(TT_PRE_COLON)
     tok = stream.peek()
-    sem: SemExpr | None = None
-    keywords: BoolNode | None = None
-    lim: int | None = None
-    tags: BoolNode | None = None
 
     if tok and tok.type == TT_SEM_COLON:
         sem = _parse_sem(stream)
         kind = "sem"
-        # Optional lim:
-        nxt = stream.peek()
-        if nxt and nxt.type == TT_LIM_COLON:
-            stream.consume(TT_LIM_COLON)
-            lim = int(stream.consume(TT_NUMBER).value)
-    elif tok and tok.type == TT_KEYWORDS_COLON:
+        lim, tags, filters = _parse_modifiers(stream, allow_lim=True, stop_at_req=True)
+        return PrefetchClause(kind=kind, sem=sem, lim=lim, tags=tags, filters=filters)
+
+    if tok and tok.type == TT_KEYWORDS_COLON:
         stream.consume(TT_KEYWORDS_COLON)
         keywords = _parse_bool_expr(stream)
-        kind = "keywords"
-    else:
-        raise ValueError(f"Expected sem: or keywords: after pre:, got {tok!r}")
+        # lim: not valid for keywords prefetch
+        _, tags, filters = _parse_modifiers(stream, allow_lim=False, stop_at_req=True)
+        return PrefetchClause(kind="keywords", keywords=keywords, tags=tags, filters=filters)
 
-    # Optional tags:
-    nxt = stream.peek()
-    if nxt and nxt.type == TT_TAGS_COLON:
-        stream.consume(TT_TAGS_COLON)
-        tags = _parse_bool_expr(stream)
-
-    return PrefetchClause(kind=kind, sem=sem, keywords=keywords, lim=lim, tags=tags)
+    raise ValueError(f"Expected sem: or keywords: after pre:, got {tok!r}")
 
 
 def _parse_req(stream: _Stream) -> ReqClause:
@@ -448,10 +578,6 @@ def _parse_req(stream: _Stream) -> ReqClause:
     """
     stream.consume(TT_REQ_COLON)
     tok = stream.peek()
-    sem: SemExpr | None = None
-    keywords: BoolNode | None = None
-    lim: int | None = None
-    tags: BoolNode | None = None
 
     if tok and tok.type == TT_SEM_COLON:
         sem = _parse_sem(stream)
@@ -460,30 +586,21 @@ def _parse_req(stream: _Stream) -> ReqClause:
         stream.consume(TT_KEYWORDS_COLON)
         keywords = _parse_bool_expr(stream)
         kind = "keywords"
+    elif tok and tok.type == TT_QUOTED:
+        # Bare quoted string treated as sem positive
+        positive = stream.consume(TT_QUOTED).value
+        sem = SemExpr(positive=positive)
+        kind = "sem"
     else:
-        # Bare quoted string after req: treated as sem positive without sem: prefix
-        if tok and tok.type == TT_QUOTED:
-            positive = stream.consume(TT_QUOTED).value
-            sem = SemExpr(positive=positive)
-            kind = "sem"
-        else:
-            raise ValueError(
-                f"Expected sem:, keywords:, or quoted string after req:, got {tok!r}"
-            )
+        raise ValueError(
+            f"Expected sem:, keywords:, or quoted string after req:, got {tok!r}"
+        )
 
-    # Optional lim:
-    nxt = stream.peek()
-    if nxt and nxt.type == TT_LIM_COLON:
-        stream.consume(TT_LIM_COLON)
-        lim = int(stream.consume(TT_NUMBER).value)
+    lim, tags, filters = _parse_modifiers(stream, allow_lim=True, stop_at_req=False)
 
-    # Optional tags:
-    nxt = stream.peek()
-    if nxt and nxt.type == TT_TAGS_COLON:
-        stream.consume(TT_TAGS_COLON)
-        tags = _parse_bool_expr(stream)
-
-    return ReqClause(kind=kind, sem=sem, keywords=keywords, lim=lim, tags=tags)
+    if kind == "sem":
+        return ReqClause(kind=kind, sem=sem, lim=lim, tags=tags, filters=filters)  # type: ignore[possibly-undefined]
+    return ReqClause(kind=kind, keywords=keywords, lim=lim, tags=tags, filters=filters)  # type: ignore[possibly-undefined]
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +625,16 @@ def parse_query(text: str) -> SimpleQuery | ComplexQuery:
         ValueError: If the structured query syntax is malformed.
     """
     stripped = text.strip()
+
     if not re.match(r"^c:", stripped, re.IGNORECASE):
+        # Simple query — extract any trailing filter: clauses
+        filter_match = re.search(r"(?i)\bfilter:", stripped)
+        if filter_match:
+            query_text = stripped[: filter_match.start()].strip()
+            tokens = _tokenize(stripped[filter_match.start():])
+            stream = _Stream(tokens=tokens)
+            filters = _parse_filter_clauses(stream)
+            return SimpleQuery(text=query_text, filters=filters)
         return SimpleQuery(text=stripped)
 
     tokens = _tokenize(stripped)
