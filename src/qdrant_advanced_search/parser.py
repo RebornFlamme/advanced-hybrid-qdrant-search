@@ -79,7 +79,6 @@ class PrefetchClause:
         sem: Semantic expression, present when kind == "sem".
         keywords: Boolean expression, present when kind == "keywords".
         lim: Optional limit for semantic prefetch.
-        tags: Optional tag filter as a boolean expression.
         filters: Optional list of payload field filters.
     """
 
@@ -87,7 +86,6 @@ class PrefetchClause:
     sem: SemExpr | None = None
     keywords: BoolNode | None = None
     lim: int | None = None
-    tags: BoolNode | None = None
     filters: list[FilterClause] = field(default_factory=list)
 
 
@@ -100,7 +98,6 @@ class ReqClause:
         sem: Semantic expression, present when kind == "sem".
         keywords: Boolean expression, present when kind == "keywords".
         lim: Optional result limit.
-        tags: Optional tag filter as a boolean expression.
         filters: Optional list of payload field filters.
     """
 
@@ -108,7 +105,6 @@ class ReqClause:
     sem: SemExpr | None = None
     keywords: BoolNode | None = None
     lim: int | None = None
-    tags: BoolNode | None = None
     filters: list[FilterClause] = field(default_factory=list)
 
 
@@ -147,7 +143,6 @@ TT_PRE_COLON = "PRE_COLON"
 TT_REQ_COLON = "REQ_COLON"
 TT_SEM_COLON = "SEM_COLON"
 TT_KEYWORDS_COLON = "KEYWORDS_COLON"
-TT_TAGS_COLON = "TAGS_COLON"
 TT_LIM_COLON = "LIM_COLON"
 TT_FILTER_COLON = "FILTER_COLON"
 TT_AND = "AND"
@@ -169,7 +164,6 @@ _TOKEN_PATTERNS: list[tuple[str, str]] = [
     (TT_REQ_COLON, r"req:"),
     (TT_SEM_COLON, r"sem:"),
     (TT_KEYWORDS_COLON, r"keywords:"),
-    (TT_TAGS_COLON, r"tags:"),
     (TT_LIM_COLON, r"lim:"),
     (TT_FILTER_COLON, r"filter:"),
     (TT_AND, r"AND(?=[\s()\"\[])"),
@@ -192,7 +186,7 @@ _MASTER_RE = re.compile(
 )
 
 # Tokens that mark the boundary of a bool expression (stop parsing)
-_BOOL_STOPS = {TT_LIM_COLON, TT_TAGS_COLON, TT_FILTER_COLON, TT_REQ_COLON}
+_BOOL_STOPS = {TT_LIM_COLON, TT_FILTER_COLON, TT_REQ_COLON}
 
 
 @dataclass
@@ -498,8 +492,8 @@ def _parse_modifiers(
     *,
     allow_lim: bool = True,
     stop_at_req: bool = True,
-) -> tuple[int | None, BoolNode | None, list[FilterClause]]:
-    """Parse optional lim:, tags:, and filter: modifiers in any order.
+) -> tuple[int | None, list[FilterClause]]:
+    """Parse optional lim: and filter: modifiers in any order.
 
     Args:
         stream: The current token stream.
@@ -507,10 +501,9 @@ def _parse_modifiers(
         stop_at_req: Whether to stop when req: is encountered.
 
     Returns:
-        Tuple of (lim, tags, filters).
+        Tuple of (lim, filters).
     """
     lim: int | None = None
-    tags: BoolNode | None = None
     filters: list[FilterClause] = []
 
     while not stream.at_end():
@@ -522,15 +515,12 @@ def _parse_modifiers(
         if allow_lim and nxt.type == TT_LIM_COLON:
             stream.consume(TT_LIM_COLON)
             lim = int(stream.consume(TT_NUMBER).value)
-        elif nxt.type == TT_TAGS_COLON:
-            stream.consume(TT_TAGS_COLON)
-            tags = _parse_bool_expr(stream)
         elif nxt.type == TT_FILTER_COLON:
             filters.append(_parse_filter_clause(stream))
         else:
             break
 
-    return lim, tags, filters
+    return lim, filters
 
 
 def _parse_prefetch(stream: _Stream) -> PrefetchClause:
@@ -551,15 +541,15 @@ def _parse_prefetch(stream: _Stream) -> PrefetchClause:
     if tok and tok.type == TT_SEM_COLON:
         sem = _parse_sem(stream)
         kind = "sem"
-        lim, tags, filters = _parse_modifiers(stream, allow_lim=True, stop_at_req=True)
-        return PrefetchClause(kind=kind, sem=sem, lim=lim, tags=tags, filters=filters)
+        lim, filters = _parse_modifiers(stream, allow_lim=True, stop_at_req=True)
+        return PrefetchClause(kind=kind, sem=sem, lim=lim, filters=filters)
 
     if tok and tok.type == TT_KEYWORDS_COLON:
         stream.consume(TT_KEYWORDS_COLON)
         keywords = _parse_bool_expr(stream)
         # lim: not valid for keywords prefetch
-        _, tags, filters = _parse_modifiers(stream, allow_lim=False, stop_at_req=True)
-        return PrefetchClause(kind="keywords", keywords=keywords, tags=tags, filters=filters)
+        _, filters = _parse_modifiers(stream, allow_lim=False, stop_at_req=True)
+        return PrefetchClause(kind="keywords", keywords=keywords, filters=filters)
 
     raise ValueError(f"Expected sem: or keywords: after pre:, got {tok!r}")
 
@@ -596,11 +586,11 @@ def _parse_req(stream: _Stream) -> ReqClause:
             f"Expected sem:, keywords:, or quoted string after req:, got {tok!r}"
         )
 
-    lim, tags, filters = _parse_modifiers(stream, allow_lim=True, stop_at_req=False)
+    lim, filters = _parse_modifiers(stream, allow_lim=True, stop_at_req=False)
 
     if kind == "sem":
-        return ReqClause(kind=kind, sem=sem, lim=lim, tags=tags, filters=filters)  # type: ignore[possibly-undefined]
-    return ReqClause(kind=kind, keywords=keywords, lim=lim, tags=tags, filters=filters)  # type: ignore[possibly-undefined]
+        return ReqClause(kind=kind, sem=sem, lim=lim, filters=filters)  # type: ignore[possibly-undefined]
+    return ReqClause(kind=kind, keywords=keywords, lim=lim, filters=filters)  # type: ignore[possibly-undefined]
 
 
 # ---------------------------------------------------------------------------

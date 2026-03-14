@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from qdrant_advanced_search.parser import (
     ComplexQuery,
-    Literal,
     SemExpr,
     SimpleQuery,
     parse_query,
@@ -172,20 +171,6 @@ def test_filter_single_value():
     q = parse_query('test filter: author IN ["Dupont"]')
     assert isinstance(q, SimpleQuery)
     assert q.filters[0].values == ["Dupont"]
-
-
-# ---------------------------------------------------------------------------
-# Coexistence with tags:
-# ---------------------------------------------------------------------------
-
-
-def test_req_tags_and_filter_together():
-    q = parse_query('c: req: sem: "football" tags: #SPORT filter: year IN [2023]')
-    assert isinstance(q, ComplexQuery)
-    assert q.req.tags is not None
-    assert isinstance(q.req.tags, Literal)
-    assert q.req.tags.value == "#SPORT"
-    assert q.req.filters[0].field == "year"
 
 
 # ---------------------------------------------------------------------------

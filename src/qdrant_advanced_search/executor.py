@@ -13,6 +13,7 @@ from qdrant_client.models import (
     Prefetch,
     RecommendQuery,
 )
+
 from sentence_transformers import SentenceTransformer
 
 from qdrant_advanced_search.parser import (
@@ -45,7 +46,6 @@ class QueryExecutor:
         collection_name: str = "documents",
         model: str | SentenceTransformer = "paraphrase-multilingual-MiniLM-L12-v2",
         text_field: str = "text",
-        tags_field: str = "tags",
         document_id_field: str = "document_id",
         paragraph_id_field: str = "paragraph_id",
         default_limit: int = 50,
@@ -61,7 +61,6 @@ class QueryExecutor:
             model: Either a model name string or an already-loaded
                 SentenceTransformer instance.
             text_field: Payload field containing paragraph text.
-            tags_field: Payload field containing the tag string.
             document_id_field: Payload field containing the document identifier.
             paragraph_id_field: Payload field containing the paragraph identifier.
             default_limit: Default result limit for main queries.
@@ -75,7 +74,6 @@ class QueryExecutor:
         self._client = client if client is not None else QdrantClient(url=qdrant_url)
         self._collection_name = collection_name
         self._text_field = text_field
-        self._tags_field = tags_field
         self._document_id_field = document_id_field
         self._paragraph_id_field = paragraph_id_field
         self._default_limit = default_limit
@@ -102,16 +100,15 @@ class QueryExecutor:
     # ------------------------------------------------------------------
 
     def _ensure_indexes(self) -> None:
-        """Create full-text payload indexes if they do not already exist."""
-        for field_name in (self._text_field, self._tags_field):
-            try:
-                self._client.create_payload_index(
-                    self._collection_name,
-                    field_name=field_name,
-                    field_schema=PayloadSchemaType.TEXT,
-                )
-            except Exception:  # noqa: BLE001
-                pass  # index already exists
+        """Create a full-text payload index on text_field if it does not already exist."""
+        try:
+            self._client.create_payload_index(
+                self._collection_name,
+                field_name=self._text_field,
+                field_schema=PayloadSchemaType.TEXT,
+            )
+        except Exception:  # noqa: BLE001
+            pass  # index already exists
 
     def _encode(self, text: str) -> list[float]:
         """Encode a string to a vector using the SentenceTransformer model.
@@ -130,7 +127,7 @@ class QueryExecutor:
 
         Args:
             node: The boolean expression node to convert.
-            field_key: The payload field to match against (e.g. "text" or "tags").
+            field_key: The payload field to match against (e.g. "text").
 
         Returns:
             A Qdrant Filter object.
@@ -155,6 +152,9 @@ class QueryExecutor:
     def _filter_clauses_to_filter(clauses: list[FilterClause]) -> Filter | None:
         """Convert a list of FilterClause objects into a Qdrant Filter (AND of all).
 
+        String values use MatchText (full-text substring match, requires a text index).
+        Integer values use MatchAny (exact match).
+
         Args:
             clauses: List of payload field filter clauses.
 
@@ -165,11 +165,32 @@ class QueryExecutor:
             return None
         conditions: list[Filter] = []
         for clause in clauses:
-            cond = FieldCondition(key=clause.field, match=MatchAny(any=clause.values))
-            if clause.exclude:
-                conditions.append(Filter(must_not=[cond]))
+            str_values = [v for v in clause.values if isinstance(v, str)]
+            int_values = [v for v in clause.values if isinstance(v, int)]
+
+            sub_conditions: list[FieldCondition] = []
+            for sv in str_values:
+                sub_conditions.append(FieldCondition(key=clause.field, match=MatchText(text=sv)))
+            if int_values:
+                sub_conditions.append(
+                    FieldCondition(key=clause.field, match=MatchAny(any=int_values))
+                )
+
+            if not sub_conditions:
+                continue
+
+            if len(sub_conditions) == 1:
+                inner: Filter | FieldCondition = sub_conditions[0]
             else:
-                conditions.append(Filter(must=[cond]))
+                inner = Filter(should=sub_conditions)
+
+            if clause.exclude:
+                conditions.append(Filter(must_not=[inner]))
+            else:
+                conditions.append(Filter(must=[inner]))
+
+        if not conditions:
+            return None
         if len(conditions) == 1:
             return conditions[0]
         return Filter(must=conditions)
@@ -269,12 +290,7 @@ class QueryExecutor:
         pre = q.prefetch
         req = q.req
 
-        req_tags_filter: Filter | None = None
-        if req.tags is not None:
-            req_tags_filter = self._bool_to_filter(req.tags, self._tags_field)
-
-        req_payload_filter = self._filter_clauses_to_filter(req.filters)
-        req_base_filter = self._merge_filters(req_tags_filter, req_payload_filter)
+        req_base_filter = self._filter_clauses_to_filter(req.filters)
 
         req_kw_filter: Filter | None = None
         if req.keywords is not None:
@@ -312,12 +328,7 @@ class QueryExecutor:
         # ----------------------------------------------------------------
         # Build prefetch filters
         # ----------------------------------------------------------------
-        pre_tags_filter: Filter | None = None
-        if pre.tags is not None:
-            pre_tags_filter = self._bool_to_filter(pre.tags, self._tags_field)
-
-        pre_payload_filter = self._filter_clauses_to_filter(pre.filters)
-        pre_base_filter = self._merge_filters(pre_tags_filter, pre_payload_filter)
+        pre_base_filter = self._filter_clauses_to_filter(pre.filters)
 
         pre_kw_filter: Filter | None = None
         if pre.keywords is not None:

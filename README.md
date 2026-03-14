@@ -59,13 +59,12 @@ A **complex query** must start with `c:` and supports the following clauses:
 | `req: sem: "..." NOT "..."` | Semantic request with negative example | `req: sem: "bronzage" NOT "piscine"` |
 | `req: keywords: EXPR` | Keyword boolean request | `req: keywords: "sport" AND NOT "foot"` |
 | `lim: N` | Result limit (on `req:` or `pre: sem:`) | `lim: 50` |
-| `tags: EXPR` | Tag filter (boolean, on `pre:` or `req:`) | `tags: #SPORT OR #NATURE` |
 | `filter: field IN [v, ...]` | Payload field inclusion filter | `filter: category IN ["sport"]` |
 | `filter: field NOT IN [v, ...]` | Payload field exclusion filter | `filter: year NOT IN [2020]` |
 
 ### Boolean expression syntax
 
-Inside `keywords:` and `tags:` clauses:
+Inside `keywords:` clauses:
 
 - Terms are quoted strings `"word"` or bare words (e.g. `#TAG`)
 - Operators (case-insensitive): `AND`, `OR`, `NOT`
@@ -73,7 +72,7 @@ Inside `keywords:` and `tags:` clauses:
 
 ### Payload filter syntax
 
-`filter:` applies exact-value matching on any Qdrant payload field. It can be placed on `pre:`, `req:`, or a simple query. Multiple `filter:` clauses are combined with AND.
+`filter:` matches on any Qdrant payload field. String values use full-text (substring) matching; integer values use exact matching. It can be placed on `pre:`, `req:`, or a simple query. Multiple `filter:` clauses are combined with AND.
 
 - `field` — exact payload field name
 - Values — quoted strings `"val"` or integers `42`, comma-separated
@@ -98,8 +97,8 @@ c: pre: keywords: ("plage" OR "vacances") AND "sport" req: sem: "Crème de bronz
 # Keyword prefetch with NOT → semantic request with negative example
 c: pre: keywords: ("plage" OR "vacances") AND NOT "sport" req: sem: "Crème de bronzage" NOT "Après soleil" lim: 50
 
-# Tag filtering
-c: req: sem: "football" tags: #SPORT
+# Filter by tag value (substring match on the tags payload field)
+c: req: sem: "football" filter: tags IN ["#SPORT"]
 
 # Payload filter on req — exclude specific documents
 c: req: sem: "alcène" filter: document_id NOT IN [12, 45] lim: 20
@@ -123,8 +122,7 @@ All `QueryExecutor.__init__` parameters are keyword-only with sensible defaults:
 | `client` | `QdrantClient \| None` | `None` | An already-instantiated `QdrantClient` |
 | `collection_name` | `str` | `"documents"` | Qdrant collection to search |
 | `model` | `str \| SentenceTransformer` | `"paraphrase-multilingual-MiniLM-L12-v2"` | Model name or loaded instance |
-| `text_field` | `str` | `"text"` | Payload field containing paragraph text |
-| `tags_field` | `str` | `"tags"` | Payload field containing tag string |
+| `text_field` | `str` | `"text"` | Payload field containing paragraph text (full-text indexed) |
 | `document_id_field` | `str` | `"document_id"` | Payload field for the document ID |
 | `paragraph_id_field` | `str` | `"paragraph_id"` | Payload field for the paragraph ID |
 | `default_limit` | `int` | `50` | Default result limit for main queries |
