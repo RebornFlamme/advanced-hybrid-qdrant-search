@@ -12,7 +12,7 @@ from qdrant_advanced_search import QueryExecutor
 # Module-level executor (model loads once at import time)
 # ---------------------------------------------------------------------------
 
-executor = QueryExecutor()
+executor = QueryExecutor(parquet_path="documents.parquet")
 
 # ---------------------------------------------------------------------------
 # Styles

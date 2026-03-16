@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pandas as pd
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     FieldCondition,
     Filter,
-    HasIdCondition,
     MatchAny,
     MatchText,
     PayloadSchemaType,
@@ -18,6 +20,7 @@ from sentence_transformers import SentenceTransformer
 
 from qdrant_advanced_search.parser import (
     BoolNode,
+    BoolOp,
     ComplexQuery,
     FilterClause,
     Literal,
@@ -47,7 +50,10 @@ class QueryExecutor:
         model: str | SentenceTransformer = "paraphrase-multilingual-MiniLM-L12-v2",
         text_field: str = "text",
         document_id_field: str = "document_id",
-        paragraph_id_field: str = "paragraph_id",
+        point_id_field: str = "paragraph_id",
+        parquet_path: str | Path | None = None,
+        parquet_text_column: str = "text",
+        parquet_id_column: str = "document_id",
         default_limit: int = 50,
         default_pre_limit: int = 50,
     ) -> None:
@@ -60,9 +66,13 @@ class QueryExecutor:
             collection_name: Name of the Qdrant collection to search.
             model: Either a model name string or an already-loaded
                 SentenceTransformer instance.
-            text_field: Payload field containing paragraph text.
-            document_id_field: Payload field containing the document identifier.
-            paragraph_id_field: Payload field containing the paragraph identifier.
+            text_field: Payload field containing paragraph text (used for tags index).
+            document_id_field: Payload field in Qdrant containing the document identifier.
+            point_id_field: Payload field in Qdrant containing the point/paragraph identifier
+                (note: Qdrant point ``.id`` IS the paragraph ID, this names its payload field).
+            parquet_path: Path to the parquet file used for keyword searches.
+            parquet_text_column: Column name for document text in the parquet file.
+            parquet_id_column: Column name for document IDs in the parquet file.
             default_limit: Default result limit for main queries.
             default_pre_limit: Default result limit for prefetch queries.
         """
@@ -75,9 +85,15 @@ class QueryExecutor:
         self._collection_name = collection_name
         self._text_field = text_field
         self._document_id_field = document_id_field
-        self._paragraph_id_field = paragraph_id_field
+        self._point_id_field = point_id_field
         self._default_limit = default_limit
         self._default_pre_limit = default_pre_limit
+
+        self._parquet_df: pd.DataFrame | None = None
+        self._parquet_text_col = parquet_text_column
+        self._parquet_id_col = parquet_id_column
+        if parquet_path is not None:
+            self._parquet_df = pd.read_parquet(parquet_path, columns=[parquet_id_column, parquet_text_column])
 
         self._ensure_indexes()
 
@@ -121,32 +137,55 @@ class QueryExecutor:
         """
         return self._model.encode(text).tolist()
 
-    @staticmethod
-    def _bool_to_filter(node: BoolNode, field_key: str) -> Filter:
-        """Recursively convert a BoolNode to a Qdrant Filter.
+    def _eval_keywords_mask(self, node: BoolNode, series: pd.Series) -> pd.Series:
+        """Recursively evaluate a BoolNode as a boolean mask over a text Series.
 
         Args:
-            node: The boolean expression node to convert.
-            field_key: The payload field to match against (e.g. "text").
+            node: The boolean expression node.
+            series: A pandas Series of text strings to match against.
 
         Returns:
-            A Qdrant Filter object.
+            A boolean Series.
         """
         if isinstance(node, Literal):
-            condition = FieldCondition(
-                key=field_key,
-                match=MatchText(text=node.value),
-            )
-            if node.negated:
-                return Filter(must_not=[condition])
-            return Filter(must=[condition])
-        # BoolOp
-        left_filter = QueryExecutor._bool_to_filter(node.left, field_key)
-        right_filter = QueryExecutor._bool_to_filter(node.right, field_key)
+            mask = series.str.contains(node.value, case=False, na=False, regex=False)
+            return ~mask if node.negated else mask
+        assert isinstance(node, BoolOp)
+        left = self._eval_keywords_mask(node.left, series)
+        right = self._eval_keywords_mask(node.right, series)
         if node.op == "AND":
-            return Filter(must=[left_filter, right_filter])
-        # OR
-        return Filter(should=[left_filter, right_filter])
+            return left & right
+        return left | right
+
+    def _keywords_to_doc_ids(self, node: BoolNode) -> list[int]:
+        """Search the parquet file for documents matching a keyword BoolNode.
+
+        Args:
+            node: The boolean keyword expression to evaluate.
+
+        Returns:
+            List of matching document IDs in parquet order.
+
+        Raises:
+            RuntimeError: If no parquet file was configured.
+        """
+        if self._parquet_df is None:
+            raise RuntimeError("parquet_path must be provided to use keyword searches")
+        mask = self._eval_keywords_mask(node, self._parquet_df[self._parquet_text_col])  # type: ignore[arg-type]
+        return self._parquet_df.loc[mask, self._parquet_id_col].tolist()
+
+    def _doc_ids_to_filter(self, doc_ids: list[int]) -> Filter:
+        """Build a Qdrant Filter restricting results to the given document IDs.
+
+        Args:
+            doc_ids: List of document IDs to include.
+
+        Returns:
+            A Qdrant Filter using MatchAny on the document_id payload field.
+        """
+        return Filter(
+            must=[FieldCondition(key=self._document_id_field, match=MatchAny(any=doc_ids))]
+        )
 
     @staticmethod
     def _filter_clauses_to_filter(clauses: list[FilterClause]) -> Filter | None:
@@ -291,11 +330,6 @@ class QueryExecutor:
         req = q.req
 
         req_base_filter = self._filter_clauses_to_filter(req.filters)
-
-        req_kw_filter: Filter | None = None
-        if req.keywords is not None:
-            req_kw_filter = self._bool_to_filter(req.keywords, self._text_field)
-
         req_lim = req.lim or self._default_limit
 
         # ----------------------------------------------------------------
@@ -316,24 +350,25 @@ class QueryExecutor:
                 )
                 return self._extract_ids([p.payload or {} for p in result.points])
 
-            combined = self._merge_filters(req_kw_filter, req_base_filter)
-            records, _ = self._client.scroll(
-                collection_name=self._collection_name,
-                scroll_filter=combined,
-                limit=req_lim,
-                with_payload=True,
-            )
-            return self._extract_ids([r.payload or {} for r in records])
+            # req: keywords → parquet search
+            doc_ids = self._keywords_to_doc_ids(req.keywords)  # type: ignore[arg-type]
+            if not doc_ids:
+                return []
+            if req_base_filter is not None:
+                combined_filter = self._merge_filters(self._doc_ids_to_filter(doc_ids), req_base_filter)
+                records, _ = self._client.scroll(
+                    collection_name=self._collection_name,
+                    scroll_filter=combined_filter,
+                    limit=req_lim,
+                    with_payload=True,
+                )
+                return self._extract_ids([r.payload or {} for r in records])
+            return doc_ids[:req_lim]
 
         # ----------------------------------------------------------------
-        # Build prefetch filters
+        # Build prefetch info
         # ----------------------------------------------------------------
         pre_base_filter = self._filter_clauses_to_filter(pre.filters)
-
-        pre_kw_filter: Filter | None = None
-        if pre.keywords is not None:
-            pre_kw_filter = self._bool_to_filter(pre.keywords, self._text_field)
-
         pre_lim = pre.lim or self._default_pre_limit
 
         # ----------------------------------------------------------------
@@ -381,37 +416,31 @@ class QueryExecutor:
                 query_filter=pre_base_filter,
                 limit=pre_lim,
             )
-            pre_ids: list[str] = [p.id for p in pre_result.points]  # type: ignore[misc]
-            if not pre_ids:
+            sem_doc_ids = self._extract_ids([p.payload or {} for p in pre_result.points])
+            kw_doc_ids = set(self._keywords_to_doc_ids(req.keywords))  # type: ignore[arg-type]
+            intersected = [d for d in sem_doc_ids if d in kw_doc_ids]
+            if not intersected:
                 return []
-            id_filter = Filter(must=[HasIdCondition(has_id=pre_ids)])
-            combined = self._merge_filters(
-                id_filter, self._merge_filters(req_kw_filter, req_base_filter)
-            )
-            records, _ = self._client.scroll(
-                collection_name=self._collection_name,
-                scroll_filter=combined,
-                limit=req_lim,
-                with_payload=True,
-            )
-            return self._extract_ids([r.payload or {} for r in records])
+            if req_base_filter is not None:
+                combined_filter = self._merge_filters(self._doc_ids_to_filter(intersected), req_base_filter)
+                records, _ = self._client.scroll(
+                    collection_name=self._collection_name,
+                    scroll_filter=combined_filter,
+                    limit=req_lim,
+                    with_payload=True,
+                )
+                return self._extract_ids([r.payload or {} for r in records])
+            return intersected[:req_lim]
 
         # ----------------------------------------------------------------
         # pre: keywords + req: sem
         # ----------------------------------------------------------------
         if pre.kind == "keywords" and req.kind == "sem":
-            pre_combined = self._merge_filters(pre_kw_filter, pre_base_filter)
-            pre_records, _ = self._client.scroll(
-                collection_name=self._collection_name,
-                scroll_filter=pre_combined,
-                limit=1000,
-                with_payload=False,
-            )
-            pre_ids_kw: list[str] = [r.id for r in pre_records]  # type: ignore[misc]
-            if not pre_ids_kw:
+            pre_doc_ids = self._keywords_to_doc_ids(pre.keywords)  # type: ignore[arg-type]
+            if not pre_doc_ids:
                 return []
-            id_filter = Filter(must=[HasIdCondition(has_id=pre_ids_kw)])
-            combined_filter = self._merge_filters(id_filter, req_base_filter)
+            pre_doc_filter = self._merge_filters(self._doc_ids_to_filter(pre_doc_ids), pre_base_filter)
+            combined_filter = self._merge_filters(pre_doc_filter, req_base_filter)
 
             req_vec = self._encode(req.sem.positive)  # type: ignore[union-attr]
             req_q: list[float] | RecommendQuery = req_vec
@@ -430,14 +459,19 @@ class QueryExecutor:
         # ----------------------------------------------------------------
         # pre: keywords + req: keywords
         # ----------------------------------------------------------------
-        combined = self._merge_filters(
-            self._merge_filters(pre_kw_filter, pre_base_filter),
-            self._merge_filters(req_kw_filter, req_base_filter),
-        )
-        records, _ = self._client.scroll(
-            collection_name=self._collection_name,
-            scroll_filter=combined,
-            limit=req_lim,
-            with_payload=True,
-        )
-        return self._extract_ids([r.payload or {} for r in records])
+        pre_doc_ids_list = self._keywords_to_doc_ids(pre.keywords)  # type: ignore[arg-type]
+        req_doc_ids_set = set(self._keywords_to_doc_ids(req.keywords))  # type: ignore[arg-type]
+        doc_ids = [d for d in pre_doc_ids_list if d in req_doc_ids_set]
+        if not doc_ids:
+            return []
+        combined_tags = self._merge_filters(pre_base_filter, req_base_filter)
+        if combined_tags is not None:
+            final_filter = self._merge_filters(self._doc_ids_to_filter(doc_ids), combined_tags)
+            records, _ = self._client.scroll(
+                collection_name=self._collection_name,
+                scroll_filter=final_filter,
+                limit=req_lim,
+                with_payload=True,
+            )
+            return self._extract_ids([r.payload or {} for r in records])
+        return doc_ids[:req_lim]

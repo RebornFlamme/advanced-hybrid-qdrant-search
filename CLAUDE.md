@@ -121,6 +121,9 @@ c: pre: sem: "Nutrition sportive" lim: 50 req: sem: "Protéines" tags: #SPORT AN
 c: pre: keywords: "musculation" tags: #SPORT req: sem: "Récupération" tags: #NUTRITION lim: 25
 ```
 
+## Tests 
+documents.parquet
+
 
 ## Instructions
 Whenever corrected, after making a mistake or misinterpreting, add a section in here. (`CLAUDE.MD`) to instruct future sessions, avoiding the mistake again. 
