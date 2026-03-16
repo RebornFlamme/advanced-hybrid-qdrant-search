@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import dash
 from dash import Input, Output, dcc, html
 from qdrant_client.models import FieldCondition, Filter, MatchValue
@@ -12,7 +14,7 @@ from qdrant_advanced_search import QueryExecutor
 # Module-level executor (model loads once at import time)
 # ---------------------------------------------------------------------------
 
-executor = QueryExecutor(parquet_path="documents.parquet")
+executor = QueryExecutor(parquet_path=Path(__file__).parent.parent / "documents.parquet")
 
 # ---------------------------------------------------------------------------
 # Styles
@@ -249,3 +251,7 @@ def update_results(query: str | None) -> html.Div:
     ]
 
     return html.Div([count_label, *cards])
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
